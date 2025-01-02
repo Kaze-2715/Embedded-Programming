@@ -1,6 +1,7 @@
 #include <MsTimer2.h>
 #include <Adafruit_GFX.h>//申明OLED 12864的函数库
 #include <Adafruit_SSD1306.h>//申明OLED 12864的函数库
+#include <IRremote.h>
 #include "dht11.h"
 
 #define Fan_Pin       10                  // 风扇PWM管脚
@@ -8,6 +9,7 @@
 #define GM_Pin       A0                 //光敏管脚
 #define LED_Pin      12                 //双色LED管脚
 #define OLED_RESET   8
+#define RECV_PIN     11                   // 红外接收引脚
 
 int GetTempToPWM(float v_fTemp); //将温度转换为风扇转速的PWM值
 int serial_putc( char c, struct __file * ); //重定向输出函数
@@ -21,14 +23,16 @@ void warning(); //报警
 void displayWaringT(); //显示温度报警信息
 void displayWaringH(); //显示湿度报警信息
 
+// 解析串口通信
 int incomingByte = 0;                    
-String inputString = "";
+char inputString[20] = {0};
 boolean newLineReceived = false;
 boolean startBit  = false;
 String returntemp = "";
 
 // OLED
 Adafruit_SSD1306 display(OLED_RESET);
+
 // 蜂鸣器
 int BEEP_Pin = 7;
 
@@ -48,24 +52,38 @@ unsigned int g_count = 10;
 int g_GM = 0;
 int g_LT = 0;
 int g_LIMIT = 25;
+
 //红外遥控器
+IRrecv irrecv(RECV_PIN);
+decode_results results;//结构声明
+boolean signalReceived = false;
+long IRcode = 0;
+
 
 void setup() {
-  //******************************************************
   //初始化温湿度传感器管脚、风扇、板载LEDIO口、双色LED IO口为输出方式
   pinMode(DHT11_Pin, OUTPUT);
   pinMode(Fan_Pin, OUTPUT);   
-  pinMode(13, OUTPUT);
   pinMode(BEEP_Pin, OUTPUT);
   pinMode(LED_Pin, OUTPUT);
+  pinMode(RECV_PIN, INPUT);   //端口模式，输入
+  pinMode(13, OUTPUT);      //端口模式，输出  
 
   digitalWrite(BEEP_Pin, HIGH);
   printf_begin(); 
   Serial.begin(9600);	          //波特率9600 （WIFI通讯设定波特率）  
-  MsTimer2::set(1000, UploadTemp);        // 中断设置函数，每 1000ms 进入一次中断，查一查！
+  MsTimer2::set(1000, UploadTemp);        // 中断设置函数，每 1000ms 进入一次中断
   MsTimer2::start();                //开始计时
+  irrecv.enableIRIn(); // Start the receiver
 
   display.begin(SSD1306_SWITCHCAPVCC, 0x3c);  // initialize with the I2C addr 0x3D (for the 128x64)
+  display.clearDisplay();   // 清屏    
+  display.setTextSize(2);   //字体尺寸大小2
+  display.setTextColor(WHITE);//字体颜色为白色
+  display.setCursor(0,8); //把光标定位在第16行，第0列
+  display.print("Hi there!");//显示问候语
+  display.display();//显示
+  delay(1000);
 
   //******************************************************
 
@@ -73,10 +91,9 @@ void setup() {
 
 void loop() 
 {
+  Serial.println(inputString);
   runtimeDHT();
-  //Serial.println("DHT");
   runtimePhoto();
-  //Serial.println("PHOTO");
   displayEnv();
   if (((g_fTemp < g_limitTfloor) || (g_fTemp > g_limitTceil)) || ((g_humidity < g_limitHfloor) || (g_humidity > g_limitHceil)))
   {
@@ -91,12 +108,23 @@ void loop()
   {
     displayWaringH();
   }
-  //Serial.println("Env");
-  while (newLineReceived)
+  if (irrecv.decode(&results))
+   {
+      IRcode = results.value;
+      Serial.println(results.value); 
+      irrecv.resume();
+      signalReceived = true;
+   }
+   if (signalReceived)
   {
     protocol();
   }
-
+  if (newLineReceived)
+  {
+    displayLine();
+    newLineReceived = false;
+    memset(inputString, sizeof(inputString), 0);
+  }
 }
 
 /**
@@ -110,6 +138,7 @@ void loop()
 */
 void serialEvent()
 {
+  int i = 0;
   while (Serial.available())
   {    
     incomingByte = Serial.read();
@@ -119,16 +148,14 @@ void serialEvent()
     }
     if(startBit == true)
     {
-       inputString += (char) incomingByte;
+       inputString[i++] = (char) incomingByte;
     }  
     if (incomingByte == '^')
     {
        newLineReceived = true; 
        startBit = false;
     }
-    Serial.print((char)incomingByte);
   }
-  Serial.println(" ");
 }
 
 int GetTempToPWM(float v_fTemp)
@@ -198,12 +225,6 @@ void runtimeDHT() //运行时对DHT11的调用
   UploadTemp();
   Serial.print("Fan Speed:");
   Serial.println(voltage); //根据现在温度输出不同PWM控制风扇转速
-  // if (g_fTemp >= 31.0)
-  // {
-  //   digitalWrite(BEEP_Pin, LOW);
-  //   delay(100);
-  //   digitalWrite(BEEP_Pin, HIGH);
-  // }
 }
 
 void runtimePhoto() //运行时对光敏电阻的调用
@@ -215,7 +236,7 @@ void runtimePhoto() //运行时对光敏电阻的调用
   Serial.println(g_LT);
   if (g_LT < ((float)g_LIMIT / 100 * 255))
   {
-    analogWrite(LED_Pin, 255);
+    analogWrite(LED_Pin, 255 - g_LT);
   }
   else
   {
@@ -258,83 +279,86 @@ void displayEnv()
 
 void protocol()
 {
-  // TODO 解析控制光线协议
-  if(inputString.indexOf("LTCTR") != -1)    //如果要检索的字符串值“LTCTR”出现
-  {
-      //returntemp = "$LTCTR-2,#";  //返回不匹配
-      Serial.print(inputString); //返回协议数据包       
-      inputString = "";   // clear the string
-      newLineReceived = false; // 前一次数据结束标志   
-  }
-  // TODO 解析红外控制协议，控制光强、温湿度阈值
-
-  // TODO 解析控制风扇转速
-
-  // TODO 解析电脑串口通信
-  //$SETT-FLOOR:20.0-CEIL:30.0^
-  if(inputString.indexOf("SETT") != -1)    //如果要检索的字符串值“LTCTR”出现
-  {
-      //returntemp = "$LTCTR-2,#";  //返回不匹配
-      Serial.print(inputString); //返回协议数据包
-      int i = inputString.indexOf("FLOOR:", 0);   //从接收到的数据中从第0位开始检索字符串"V1,"出现的位置
-      int ii = inputString.indexOf("-", i + 5); //从接收到的数据中从第i + 5位开始检索字符串"-"出现的位置
-      if(ii > i && i > 0 && ii > 0)             //如果ii和i的顺序对了并且检索到ii与i存在
-      {
-        String sV1 = inputString.substring(i + 6, ii);   //提取字符串中介于指定下标i+3到ii之间的字符赋值给sV1
-        g_limitTfloor = sV1.toFloat();
-        Serial.println(g_limitTfloor);                     //将sV1转化为浮点型赋值给fTempCtr[0]
-      }
-      i = inputString.indexOf("FLOOR:", 0);   //从接收到的数据中从第0位开始检索字符串"V1,"出现的位置
-      ii = inputString.indexOf("-", i + 5); //从接收到的数据中从第i + 5位开始检索字符串"-"出现的位置
-      if(ii > i && i > 0 && ii > 0)             //如果ii和i的顺序对了并且检索到ii与i存在
-      {
-        String sV1 = inputString.substring(i + 6, ii);   //提取字符串中介于指定下标i+3到ii之间的字符赋值给sV1
-        g_limitTceil = sV1.toFloat();
-        Serial.println(g_limitTceil);                     //将sV1转化为浮点型赋值给fTempCtr[0]
-      }       
-      inputString = "";   // clear the string
-      newLineReceived = false; // 前一次数据结束标志   
-  }
-  //$SETH-FLOOR:20.0-CEIL:30.0^
-  if(inputString.indexOf("SETH") != -1)    //如果要检索的字符串值“LTCTR”出现
-  {
-      //returntemp = "$LTCTR-2,#";  //返回不匹配
-      Serial.print(inputString); //返回协议数据包
-      int i = inputString.indexOf("FLOOR:", 0);   //从接收到的数据中从第0位开始检索字符串"V1,"出现的位置
-      int ii = inputString.indexOf("-", i + 5); //从接收到的数据中从第i + 5位开始检索字符串"-"出现的位置
-      if(ii > i && i > 0 && ii > 0)             //如果ii和i的顺序对了并且检索到ii与i存在
-      {
-        String sV1 = inputString.substring(i + 6, ii);   //提取字符串中介于指定下标i+3到ii之间的字符赋值给sV1
-        g_limitHfloor = sV1.toFloat();
-        Serial.println(g_limitTfloor);                     //将sV1转化为浮点型赋值给fTempCtr[0]
-      }
-      i = inputString.indexOf("FLOOR:", 0);   //从接收到的数据中从第0位开始检索字符串"V1,"出现的位置
-      ii = inputString.indexOf("-", i + 5); //从接收到的数据中从第i + 5位开始检索字符串"-"出现的位置
-      if(ii > i && i > 0 && ii > 0)             //如果ii和i的顺序对了并且检索到ii与i存在
-      {
-        String sV1 = inputString.substring(i + 6, ii);   //提取字符串中介于指定下标i+3到ii之间的字符赋值给sV1
-        g_limitTceil = sV1.toFloat();
-        Serial.println(g_limitTceil);                     //将sV1转化为浮点型赋值给fTempCtr[0]
-      }       
-      inputString = "";   // clear the string
-      newLineReceived = false; // 前一次数据结束标志   
-  }
-  //$SETL-L20.2^
-  if(inputString.indexOf("SETL") != -1)    //如果要检索的字符串值“LTCTR”出现
-  {
-      //returntemp = "$LTCTR-2,#";  //返回不匹配
-      Serial.print(inputString); //返回协议数据包
-      int i = inputString.indexOf("-L,", 0);   //从接收到的数据中从第0位开始检索字符串"V1,"出现的位置
-      int ii = inputString.indexOf("^", i + 4); //从接收到的数据中从第i + 3位开始检索字符串"-"出现的位置
-      if(ii > i && i > 0 && ii > 0)             //如果ii和i的顺序对了并且检索到ii与i存在
-      {
-        String sV1 = inputString.substring(i + 2, ii);   //提取字符串中介于指定下标i+3到ii之间的字符赋值给sV1
-        g_LIMIT = sV1.toFloat();                     //将sV1转化为浮点型赋值给fTempCtr[0]
+  switch (IRcode)
+    {
+      case 16754775:
+        Serial.print("Before:");
+        Serial.print(g_LIMIT);
+        g_LIMIT += 5;
+        Serial.print(" After:");
         Serial.println(g_LIMIT);
-      }                   
-      inputString = "";   // clear the string
-      newLineReceived = false; // 前一次数据结束标志   
-  }
+        break;
+      case 16769055:
+        //光敏阈值-5
+        Serial.print("Before:");
+        Serial.print(g_LIMIT);
+        g_LIMIT -= 5;
+        Serial.print(" After:");
+        Serial.println(g_LIMIT);
+        break;
+      case 16712445:
+        //温度上限+1
+        Serial.print("Before:");
+        Serial.print(g_limitTceil);
+        g_limitTceil += 1;
+        Serial.print(" After:");
+        Serial.println(g_limitTceil);
+        break;
+      case 16720605:
+        //温度上限-1
+        Serial.print("Before:");
+        Serial.print(g_limitTceil);
+        g_limitTceil -= 1;
+        Serial.print(" After:");
+        Serial.println(g_limitTceil);
+        break;
+      case 16769565:
+        //温度下限+1
+        Serial.print("Before:");
+        Serial.print(g_limitTfloor);
+        g_limitTfloor += 1;
+        Serial.print(" After:");
+        Serial.println(++g_limitTfloor);
+        break;
+      case 16753245:
+        //温度下限-1
+        Serial.print("Before:");
+        Serial.print(g_limitTfloor);
+        g_limitTfloor -= 1;
+        Serial.print(" After:");
+        Serial.println(--g_limitTfloor);
+        break;
+       case 16750695:
+      //   //湿度上限+1
+         Serial.print("Before:");
+         Serial.print(g_limitHceil);
+         Serial.print(" After:");
+         Serial.println(++g_limitHceil);
+         break;
+       case 16756815:
+        //湿度上限-1
+        Serial.print("Before:");
+        Serial.print(g_limitHceil);
+        Serial.print(" After:");
+        Serial.println(--g_limitHceil);
+        break;
+      case 16724175:
+        Serial.print("Before:");
+        Serial.print(g_limitHfloor);
+        Serial.print(" After:");
+        Serial.println(g_limitHfloor);
+        break;
+      case 16738455:
+        Serial.print("Before:");
+        Serial.print(g_limitHfloor);
+        Serial.print("After:");
+        Serial.println(g_limitHfloor);
+        break;
+      default:
+        break;
+    }
+    IRcode = 0;
+    signalReceived = false;
 }
 
 void warning()
@@ -351,14 +375,10 @@ void displayWaringT()
     char temp[30] = {0};
     snprintf(temp, sizeof(temp), "Warning!\nTemprature: %dC", (int)g_fTemp);
     display.clearDisplay();   // 清屏    
-    display.setTextSize(1);   //字体尺寸大小2
+    display.setTextSize(1);   //字体尺寸大小1
     display.setTextColor(WHITE);//字体颜色为白色
-    // display.setCursor(0,0); //把光标定位在第0行，第0列
-    // display.print("ChuangLeBo");//显示字符
-    display.setCursor(0,8); //把光标定位在第16行，第0列
+    display.setCursor(0,8); //把光标定位在第8行，第0列
     display.print(temp);//显示时间
-    // display.setCursor(0,48); //把光标定位在第48行，第0列
-    // display.print(" Wellcom!"); //显示字符
     display.display();//显示  
     delay(500); 
 }
@@ -378,4 +398,17 @@ void displayWaringH()
     // display.setCursor(0,48); //把光标定位在第48行，第0列
     // display.print(" Wellcom!"); //显示字符
     display.display();//显示 
+}
+
+void displayLine()
+{
+  display.clearDisplay();   // 清屏    
+  display.setTextSize(1);   //字体尺寸大小1
+  display.setTextColor(WHITE);//字体颜色为白色
+  for (int i = 0; inputString[i] != '\0'; i++)
+  {
+    display.setCursor(i*6,4); //把光标定位在第16行，第0列
+    display.print(inputString[i]);//显示
+  }
+  display.display();//显示
 }
